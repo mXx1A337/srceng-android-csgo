@@ -1,0 +1,49 @@
+plugins {
+    id 'com.android.application' version '8.2.2'
+}
+
+android {
+    namespace 'com.valvesoftware.source'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.valvesoftware.source'
+        minSdk 17
+        targetSdk 24
+        versionCode 1
+        versionName "1.12"
+    }
+
+    // 适配 srceng-android 的旧式目录布局（manifest/src/res/assets 都在仓库根目录）
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ['src']
+            res.srcDirs = ['res']
+            assets.srcDirs = ['assets']
+            jniLibs.srcDirs = ['libs']
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // 无外部依赖，全部源码在仓库内
+}
