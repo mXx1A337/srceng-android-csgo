@@ -28,6 +28,17 @@ jobs:
         run: |
           git clone --depth 1 --recursive https://github.com/nillerusr/source-engine.git
           cd source-engine
+          # ── 字体路径补丁（关键）──────────────────────────────────────────────
+          # 引擎源码 vgui2/vgui_surfacelib/linuxfont.cpp 的 ANDROID 分支把字体目录
+          # 写死成 <APP_DATA_PATH>/files/ = /data/user/0/<包名>/files/（应用私有目录，
+          # 外部无法写入，导致 546 次 "Failed to load custom font file ...DroidSansFallback.ttf"
+          # → 界面文字渲染不出来）。
+          # 非安卓分支用的是游戏目录内的相对路径，说明这里改成 VALVE_GAME_PATH 是合理的。
+          # VALVE_GAME_PATH 由壳设置为 /storage/emulated/0/srceng/，正是用户可写的地方。
+          sed -i 's/getenv("APP_DATA_PATH")/getenv("VALVE_GAME_PATH")/g' vgui2/vgui_surfacelib/linuxfont.cpp
+          echo "=== 字体路径补丁结果 ==="
+          grep -n "VALVE_GAME_PATH" vgui2/vgui_surfacelib/linuxfont.cpp || (echo "!! 补丁未生效" && exit 1)
+          # ────────────────────────────────────────────────────────────────────
           wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip
           unzip -q android-ndk-r10e-linux-x86_64.zip
           export ANDROID_NDK_HOME=$PWD/android-ndk-r10e/
@@ -77,3 +88,17 @@ jobs:
           name: srceng-debug-apk
           path: build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      # 验证 APK 内容：壳自带的 extras_dir.vpk 是引擎挂载"自定义菜单资产"（社交图标、字体）用的，
+      # 少了它引擎日志会报 Missing Vgui material vgui/discord_logo 等。这里打印出来，避免盲修。
+      - name: Inspect APK contents (assets / native libs)
+        run: |
+          APK=$(ls build/outputs/apk/debug/*.apk | head -1)
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          echo "--- assets/ ---"
+          unzip -l "$APK" | grep -E "assets/" || echo "!! 没有任何 assets 文件"
+          echo "--- extras_dir.vpk 是否存在 ---"
+          unzip -l "$APK" | grep -i "extras_dir.vpk" || echo "!! extras_dir.vpk 不在 APK 里（引擎会缺字体和自定义菜单图标）"
+          echo "--- 原生库数量与体积 ---"
+          unzip -l "$APK" | grep -c "lib/armeabi-v7a/" || true
+          unzip -l "$APK" | grep -E "libSDL2|libengine|libclient|liblauncher" || true
