@@ -12,6 +12,7 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost 2>/dev/null || true
+          df -h /
 
       - name: Install base dependencies
         run: |
@@ -46,8 +47,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Android SDK (manual install into $HOME)
+        run: |
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-12266719_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d android-sdk/
+          mv android-sdk/cmdline-tools android-sdk/cmdline-tools-tmp
+          mkdir -p android-sdk/cmdline-tools/latest
+          mv android-sdk/cmdline-tools-tmp/bin android-sdk/cmdline-tools-tmp/lib android-sdk/cmdline-tools-tmp/NOTICE.txt android-sdk/cmdline-tools-tmp/source.properties android-sdk/cmdline-tools/latest/
+          yes | android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=$HOME/android-sdk --licenses > /dev/null 2>&1 || true
+          android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=$HOME/android-sdk "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
 
       - name: Install Gradle
         run: |
@@ -64,3 +76,4 @@ jobs:
           name: srceng-debug-apk
           path: build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
