@@ -24,21 +24,62 @@ jobs:
           sed -i 's/ package="[^"]*"//' AndroidManifest.xml
           sed -i 's/ android:debuggable="[^"]*"//' AndroidManifest.xml
 
-      - name: Clone engine and build native libs (armv7a)
+      - name: Clone engine, patch source, build native libs (armv7a)
         run: |
           git clone --depth 1 --recursive https://github.com/nillerusr/source-engine.git
           cd source-engine
-          # ── 字体路径补丁（关键）──────────────────────────────────────────────
-          # 引擎源码 vgui2/vgui_surfacelib/linuxfont.cpp 的 ANDROID 分支把字体目录
-          # 写死成 <APP_DATA_PATH>/files/ = /data/user/0/<包名>/files/（应用私有目录，
-          # 外部无法写入，导致 546 次 "Failed to load custom font file ...DroidSansFallback.ttf"
-          # → 界面文字渲染不出来）。
-          # 非安卓分支用的是游戏目录内的相对路径，说明这里改成 VALVE_GAME_PATH 是合理的。
-          # VALVE_GAME_PATH 由壳设置为 /storage/emulated/0/srceng/，正是用户可写的地方。
-          sed -i 's/getenv("APP_DATA_PATH")/getenv("VALVE_GAME_PATH")/g' vgui2/vgui_surfacelib/linuxfont.cpp
-          echo "=== 字体路径补丁结果 ==="
-          grep -n "VALVE_GAME_PATH" vgui2/vgui_surfacelib/linuxfont.cpp || (echo "!! 补丁未生效" && exit 1)
-          # ────────────────────────────────────────────────────────────────────
+          python3 - <<'PY'
+          import sys
+
+          def replace_all(path, old, new, label):
+              data = open(path, "rb").read()
+              if new in data and old not in data:
+                  print("  已经打过补丁，跳过: %s" % path)
+                  return
+              n = data.count(old)
+              if n == 0:
+                  sys.exit("!! 找不到锚点 %r in %s" % (old[:40], path))
+              open(path, "wb").write(data.replace(old, new))
+              print("  %s：替换 %d 处 → %s" % (label, n, path))
+
+          def insert_after_first(path, anchor, ins, mark, label):
+              data = open(path, "rb").read()
+              if mark in data:
+                  print("  已经打过补丁，跳过: %s" % path)
+                  return
+              i = data.find(anchor)
+              if i < 0:
+                  sys.exit("!! 找不到锚点 %r in %s" % (anchor[:40], path))
+              open(path, "wb").write(data[:i + len(anchor)] + ins + data[i + len(anchor):])
+              print("  %s：已插入 → %s" % (label, path))
+
+          # ① 字体路径补丁
+          # 安卓分支把字体目录写死成 <APP_DATA_PATH>/files/ = /data/user/0/<包名>/files/
+          # （应用私有目录，外部无法写入 → 546 次 "Failed to load custom font file ..."）
+          # 改成 <VALVE_GAME_PATH>/files/，由壳设为 /storage/emulated/0/srceng/（用户可写）。
+          replace_all("vgui2/vgui_surfacelib/linuxfont.cpp",
+                      b'getenv("APP_DATA_PATH")', b'getenv("VALVE_GAME_PATH")',
+                      "字体路径")
+
+          # ② 主菜单"永久 loading / 背景淡出成黑屏"补丁
+          # gameui/BasePanel.cpp 的 DrawBackgroundImage()：
+          #   if ( m_bRenderingBackgroundTransition ) { alpha = ...255→0; }
+          #   if ( IsPC() && ( m_bRenderingBackgroundTransition || state == BACKGROUND_LOADING ) )
+          #        → 屏幕右下角画 console/startup_loading（转圈 loading 图）
+          # m_bRenderingBackgroundTransition 只在"下一次状态切换"时被清掉，而主菜单停在这个
+          # 状态不再切换 → ①3 秒后背景图 alpha 变负被 clamp 成 0，整屏变黑；②loading 图标永久常驻。
+          # 修法：转场时间一到就清标志并把背景 alpha 固定回 255。
+          insert_after_first(
+              "gameui/BasePanel.cpp",
+              b'alpha = clamp( alpha, 0, 255 );',
+              b' if ( m_bRenderingBackgroundTransition && frametime >= m_flTransitionEndTime ) { m_bRenderingBackgroundTransition = false; alpha = 255; }',
+              b'm_bRenderingBackgroundTransition = false; alpha = 255;',
+              "主菜单转场")
+          PY
+          echo "=== 补丁校验 ==="
+          grep -c 'getenv("VALVE_GAME_PATH")' vgui2/vgui_surfacelib/linuxfont.cpp
+          grep -c 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp
+          grep -q 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp || (echo "!! 转场补丁未生效" && exit 1)
           wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip
           unzip -q android-ndk-r10e-linux-x86_64.zip
           export ANDROID_NDK_HOME=$PWD/android-ndk-r10e/
