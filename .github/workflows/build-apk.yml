@@ -39,6 +39,7 @@ jobs:
         run: |
           mkdir -p libs/armeabi-v7a
           find source-engine/build -name "*.so" -exec cp -v {} libs/armeabi-v7a/ \; || true
+          find source-engine/lib/android/arm -name "*.so" -exec cp -v {} libs/armeabi-v7a/ \; || true
           ls -la libs/armeabi-v7a/ | head -40
 
       - name: Set up JDK 17
