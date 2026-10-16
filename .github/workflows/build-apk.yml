@@ -75,16 +75,29 @@ jobs:
               b' if ( m_bRenderingBackgroundTransition && frametime >= m_flTransitionEndTime ) { m_bRenderingBackgroundTransition = false; alpha = 255; }',
               b'm_bRenderingBackgroundTransition = false; alpha = 255;',
               "主菜单转场")
+
+          # ③ 构建标记：让引擎启动时往日志里写一行，用于确认手机上跑的是"打过补丁的版本"
+          insert_after_first(
+              "gameui/BasePanel.cpp",
+              b'void CBasePanel::DrawBackgroundImage()\r\n{\r\n',
+              b'\tstatic bool s_bAIReported = false;\r\n\tif ( !s_bAIReported ) { s_bAIReported = true; Msg( "\\n[AI-PATCH-v3] engine patches ACTIVE (font path + menu transition + marker)\\n" ); }\r\n',
+              b'[AI-PATCH-v3]',
+              "构建标记")
           PY
           echo "=== 补丁校验 ==="
           grep -c 'getenv("VALVE_GAME_PATH")' vgui2/vgui_surfacelib/linuxfont.cpp
-          grep -c 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp
           grep -q 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp || (echo "!! 转场补丁未生效" && exit 1)
+          grep -q 'AI-PATCH-v3' gameui/BasePanel.cpp || (echo "!! 构建标记未插入" && exit 1)
+          echo "补丁校验通过"
           wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip
           unzip -q android-ndk-r10e-linux-x86_64.zip
           export ANDROID_NDK_HOME=$PWD/android-ndk-r10e/
           export NDK_HOME=$PWD/android-ndk-r10e/
-          ./waf configure -T debug --android=armeabi-v7a-hard,4.9,21 --togles --disable-warns
+          # ── 改用 release 构建（关键）──────────────────────────────────────────
+          # 之前一直用 -T debug：引擎以 -O0 编译，无优化。手机上跑 2408x1080 的 Source
+          # 引擎会慢到几秒一帧 → 画面像卡住、loading 图标常亮。
+          # 官方发行脚本 nillerusr/just-old-shit/deploy.sh 用的就是 -T release。
+          ./waf configure -T release --android=armeabi-v7a-hard,4.9,21 --togles --disable-warns
           ./waf build
 
       - name: Collect native libs
