@@ -64,22 +64,22 @@ jobs:
               open(path, "wb").write(data[:i] + ins + data[i:])
               print("  %s: inserted -> %s" % (label, path))
 
-          # ---------------------------------------------------------------------------
-          # (1) Font path: Android branch hardcodes <APP_DATA_PATH>/files/ (app-private,
-          #     not writable from outside) -> switch to <VALVE_GAME_PATH>/files/
-          #     (= /storage/emulated/0/srceng, user writable).
-          # ---------------------------------------------------------------------------
-          replace_all("vgui2/vgui_surfacelib/linuxfont.cpp",
-                      b'getenv("APP_DATA_PATH")', b'getenv("VALVE_GAME_PATH")',
-                      "font path")
+          FONT = "vgui2/vgui_surfacelib/linuxfont.cpp"
+          PANEL = "gameui/BasePanel.cpp"
 
-          # ---------------------------------------------------------------------------
-          # (2) Diagnostic helper in linuxfont.cpp: write font requests to a file with
-          #     fflush, so even if the process hangs we can see the last step reached.
-          # ---------------------------------------------------------------------------
+          # ============================================================
+          # 1) Linux font path: <APP_DATA_PATH>/files/ -> <VALVE_GAME_PATH>/files/
+          # ============================================================
+          replace_all(FONT, b'getenv("APP_DATA_PATH")', b'getenv("VALVE_GAME_PATH")', "font path")
+
+          # ============================================================
+          # 2) Diagnostic helper in linuxfont.cpp (MUST be before line ~215,
+          #    i.e. before CLinuxFont::CreateFromMemory, otherwise it is used
+          #    before being declared -> compile error)
+          # ============================================================
           insert_after_first(
-              "vgui2/vgui_surfacelib/linuxfont.cpp",
-              b'#include "tier1/convar.h"\n',
+              FONT,
+              b'#include "tier0/memdbgon.h"\n',
               b'''
           #include <stdarg.h>
           #include <stdlib.h>
@@ -108,18 +108,70 @@ jobs:
               b'[AI-PATCH] font diagnostics',
               "font diag helper")
 
-          replace_all("vgui2/vgui_surfacelib/linuxfont.cpp",
+          # ============================================================
+          # 3) Trace every font file request (name -> file), and misses
+          # ============================================================
+          replace_all(FONT,
                       b'\tif( !filename ) return NULL;\n\tMsg("Found font: %s\\n", filename);',
                       b'\tif( !filename ) { AIFontDiag( "[AI-FONT] NOT-FOUND win=\'%s\'\\n", windowsFontName ); return NULL; }\n'
                       b'\tMsg("Found font: %s\\n", filename);\n'
                       b'\tAIFontDiag( "[AI-FONT] request win=\'%s\' file=\'%s\'\\n", windowsFontName, filename );',
                       "font lookup trace")
 
-          # ---------------------------------------------------------------------------
-          # (3) Diagnostic helper in BasePanel.cpp
-          # ---------------------------------------------------------------------------
+          # ============================================================
+          # 4) Deep trace of font creation + iteration cap on the height
+          #    search loop (real-device evidence: the engine hangs while
+          #    creating a font, and this loop has no termination guard)
+          # ============================================================
+          insert_after_first(
+              FONT,
+              b'bool CLinuxFont::CreateFromMemory(const char *windowsFontName, void *data, int datasize, int tall, int weight, int blur, int scanlines, int flags)\n{\n',
+              b'\tAIFontDiag( "[AI-FONT-CREATE] begin name=\'%s\' tall=%d datasize=%d\\n", windowsFontName, tall, datasize );\n',
+              b'[AI-FONT-CREATE] begin',
+              "font create entry")
+
+          insert_after_first(
+              FONT,
+              b'\tFT_Error error = FT_New_Memory_Face( FontManager().GetFontLibraryHandle(), (FT_Byte *)data, datasize, 0, &m_face );\n',
+              b'\tAIFontDiag( "[AI-FONT-CREATE] FT_New_Memory_Face err=%d\\n", error );\n',
+              b'[AI-FONT-CREATE] FT_New_Memory_Face',
+              "FT face trace")
+
           insert_before_first(
-              "gameui/BasePanel.cpp",
+              FONT,
+              b'\tbool bFirstTimeThrough = true;\n',
+              b'\tint nAIIter = 0;\n',
+              b'\tint nAIIter = 0;',
+              "loop counter")
+
+          insert_after_first(
+              FONT,
+              b'\tfor ( ;; )\n\t{\n',
+              b'\t\tnAIIter++;\n'
+              b'\t\tif ( nAIIter > 200 ) { AIFontDiag( "[AI-FONT-LOOP] ABORT after %d iters name=\'%s\' req=%d h=%d tall=%d\\n", nAIIter, windowsFontName, m_iHeightRequested, m_iHeight, m_iTall ); break; }\n',
+              b'[AI-FONT-LOOP] ABORT',
+              "loop cap")
+
+          insert_after_first(
+              FONT,
+              b'\tm_iHeight = FIXED6_2INT( fxpHeight );\n',
+              b'\t\tif ( nAIIter <= 40 ) AIFontDiag( "[AI-FONT-LOOP] it=%d name=\'%s\' req=%d h=%d inc=%d tall=%d\\n", nAIIter, windowsFontName, m_iHeightRequested, m_iHeight, IncAmount, m_iTall );\n',
+              b'[AI-FONT-LOOP] it=',
+              "loop iteration trace")
+
+          insert_after_first(
+              FONT,
+              b'\tm_faceValid = true;\n',
+              b'\tAIFontDiag( "[AI-FONT-CREATE] ok name=\'%s\' finalH=%d req=%d iters=%d\\n", windowsFontName, m_iHeight, m_iHeightRequested, nAIIter );\n',
+              b'[AI-FONT-CREATE] ok',
+              "font create exit")
+
+          # ============================================================
+          # 5) BasePanel diag helper (must be before UpdateBackgroundState,
+          #    so anchor on the function that precedes it)
+          # ============================================================
+          insert_before_first(
+              PANEL,
               b'void CBasePanel::PaintBackground()\n{\n',
               b'#include <stdarg.h>\n'
               b'#include <stdlib.h>\n'
@@ -148,15 +200,13 @@ jobs:
               b'[AI-PATCH] diagnostics: direct file write',
               "BasePanel diag helper")
 
-          # ---------------------------------------------------------------------------
-          # (4) State machine patches at top of UpdateBackgroundState()
-          #     (called every frame from CBasePanel::RunFrame)
-          #     a) startup banner + 1 Hz state snapshot -> ai_diag.txt
-          #     b) no level name + no loading dialog => clear stale "loading" flag and
-          #        force BACKGROUND_DISCONNECTED (which is the main-menu state)
-          # ---------------------------------------------------------------------------
+          # ============================================================
+          # 6) Startup banner + 1 Hz state snapshot + main-menu force
+          #    (at the top of CBasePanel::UpdateBackgroundState, called every
+          #     frame from CBasePanel::RunFrame)
+          # ============================================================
           insert_after_first(
-              "gameui/BasePanel.cpp",
+              PANEL,
               b'void CBasePanel::UpdateBackgroundState()\n{\n',
               b'\t// [AI-PATCH] startup banner + 1Hz state snapshot\n'
               b'\t{\n'
@@ -164,8 +214,8 @@ jobs:
               b'\t\tif ( !s_bBanner )\n'
               b'\t\t{\n'
               b'\t\t\ts_bBanner = true;\n'
-              b'\t\t\tAIDiag( "[AI-PATCH-v4] engine patches ACTIVE (font path + transition + menu force + diag)\\n" );\n'
-              b'\t\t\tMsg( "[AI-PATCH-v4] engine patches ACTIVE\\n" );\n'
+              b'\t\t\tAIDiag( "[AI-PATCH-v5] engine patches ACTIVE (font path + transition + menu force + diag)\\n" );\n'
+              b'\t\t\tMsg( "[AI-PATCH-v5] engine patches ACTIVE\\n" );\n'
               b'\t\t}\n'
               b'\t\tstatic float s_flNext = 0.0f;\n'
               b'\t\tstatic int s_nCount = 0;\n'
@@ -209,29 +259,26 @@ jobs:
               b'\t\t}\n'
               b'\t}\n',
               b'[AI-PATCH] startup banner',
-              "state snapshot + menu force")
+              "banner + state snapshot + menu force")
 
-          # ---------------------------------------------------------------------------
-          # (5) Background transition: clear the flag and restore alpha once the 3s
-          #     transition is over (otherwise alpha is clamped to 0 -> screen goes
-          #     black and the bottom-right loading plate stays forever).
-          # ---------------------------------------------------------------------------
+          # ============================================================
+          # 7) Background transition: clear flag + restore alpha after 3s
+          # ============================================================
           insert_after_first(
-              "gameui/BasePanel.cpp",
+              PANEL,
               b'alpha = clamp( alpha, 0, 255 );',
               b' if ( m_bRenderingBackgroundTransition && frametime >= m_flTransitionEndTime ) { m_bRenderingBackgroundTransition = false; alpha = 255; }',
               b'm_bRenderingBackgroundTransition = false; alpha = 255;',
               "menu transition")
 
-          # ---------------------------------------------------------------------------
-          # (6) Only hide the menu / draw the loading plate when a loading dialog really
-          #     exists.
-          # ---------------------------------------------------------------------------
-          replace_all("gameui/BasePanel.cpp",
+          # ============================================================
+          # 8) Only hide the menu / draw the loading plate while really loading
+          # ============================================================
+          replace_all(PANEL,
                       b'\t\tSetMenuAlpha( 0 );',
                       b'\t\tSetMenuAlpha( g_hLoadingDialog.Get() ? 0 : 255 );',
                       "hide menu only while loading")
-          replace_all("gameui/BasePanel.cpp",
+          replace_all(PANEL,
                       b'm_bRenderingBackgroundTransition || m_eBackgroundState == BACKGROUND_LOADING',
                       b'm_bRenderingBackgroundTransition || ( m_eBackgroundState == BACKGROUND_LOADING && g_hLoadingDialog.Get() )',
                       "loading plate only while loading")
@@ -239,8 +286,9 @@ jobs:
           echo "=== 补丁校验 ==="
           grep -c 'getenv("VALVE_GAME_PATH")' vgui2/vgui_surfacelib/linuxfont.cpp
           grep -q 'static void AIFontDiag' vgui2/vgui_surfacelib/linuxfont.cpp || (echo '!! 字体诊断未插入' && exit 1)
+          grep -q 'AI-FONT-LOOP] ABORT' vgui2/vgui_surfacelib/linuxfont.cpp || (echo '!! 字体循环保护未插入' && exit 1)
           grep -q 'static void AIDiag' gameui/BasePanel.cpp || (echo '!! 诊断工具未插入' && exit 1)
-          grep -q 'AI-PATCH-v4' gameui/BasePanel.cpp || (echo '!! 构建横幅未插入' && exit 1)
+          grep -q 'AI-PATCH-v5' gameui/BasePanel.cpp || (echo '!! 构建横幅未插入' && exit 1)
           grep -q 'stale loading state cleared' gameui/BasePanel.cpp || (echo '!! 主菜单强制补丁未插入' && exit 1)
           grep -q 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp || (echo '!! 转场补丁未生效' && exit 1)
           echo "补丁校验通过"
