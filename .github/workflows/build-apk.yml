@@ -29,89 +29,220 @@ jobs:
           git clone --depth 1 --recursive https://github.com/nillerusr/source-engine.git
           cd source-engine
           python3 - <<'PY'
-          import sys
+          import sys, os
 
           def replace_all(path, old, new, label):
               data = open(path, "rb").read()
               if new in data and old not in data:
-                  print("  已经打过补丁，跳过: %s" % path)
+                  print("  already patched, skip: %s" % path)
                   return
               n = data.count(old)
               if n == 0:
-                  sys.exit("!! 找不到锚点 %r in %s" % (old[:40], path))
+                  sys.exit("!! anchor not found %r in %s" % (old[:60], path))
               open(path, "wb").write(data.replace(old, new))
-              print("  %s：替换 %d 处 → %s" % (label, n, path))
+              print("  %s: replaced %d -> %s" % (label, n, path))
 
           def insert_after_first(path, anchor, ins, mark, label):
               data = open(path, "rb").read()
               if mark in data:
-                  print("  已经打过补丁，跳过: %s" % path)
+                  print("  already patched, skip: %s" % path)
                   return
               i = data.find(anchor)
               if i < 0:
-                  sys.exit("!! 找不到锚点 %r in %s" % (anchor[:40], path))
+                  sys.exit("!! anchor not found %r in %s" % (anchor[:60], path))
               open(path, "wb").write(data[:i + len(anchor)] + ins + data[i + len(anchor):])
-              print("  %s：已插入 → %s" % (label, path))
+              print("  %s: inserted -> %s" % (label, path))
 
-          # ① 字体路径补丁
-          # 安卓分支把字体目录写死成 <APP_DATA_PATH>/files/ = /data/user/0/<包名>/files/
-          # （应用私有目录，外部无法写入 → 546 次 "Failed to load custom font file ..."）
-          # 改成 <VALVE_GAME_PATH>/files/，由壳设为 /storage/emulated/0/srceng/（用户可写）。
+          def insert_before_first(path, anchor, ins, mark, label):
+              data = open(path, "rb").read()
+              if mark in data:
+                  print("  already patched, skip: %s" % path)
+                  return
+              i = data.find(anchor)
+              if i < 0:
+                  sys.exit("!! anchor not found %r in %s" % (anchor[:60], path))
+              open(path, "wb").write(data[:i] + ins + data[i:])
+              print("  %s: inserted -> %s" % (label, path))
+
+          # ---------------------------------------------------------------------------
+          # (1) Font path: Android branch hardcodes <APP_DATA_PATH>/files/ (app-private,
+          #     not writable from outside) -> switch to <VALVE_GAME_PATH>/files/
+          #     (= /storage/emulated/0/srceng, user writable).
+          # ---------------------------------------------------------------------------
           replace_all("vgui2/vgui_surfacelib/linuxfont.cpp",
                       b'getenv("APP_DATA_PATH")', b'getenv("VALVE_GAME_PATH")',
-                      "字体路径")
+                      "font path")
 
-          # ② 主菜单"永久 loading / 背景淡出成黑屏"补丁 + ③ 构建标记
-          # gameui/BasePanel.cpp 的 DrawBackgroundImage()：
-          #   if ( m_bRenderingBackgroundTransition ) { alpha = ...255→0; }
-          #   if ( IsPC() && ( m_bRenderingBackgroundTransition || state == BACKGROUND_LOADING ) )
-          #        → 屏幕右下角画 console/startup_loading（转圈 loading 图）
-          # m_bRenderingBackgroundTransition 只在"下一次状态切换"时被清掉，而主菜单停在这个
-          # 状态不再切换 → ①3 秒后背景图 alpha 变负被 clamp 成 0，整屏变黑；②loading 图标永久常驻。
-          # 修法：转场时间一到就清标志并把背景 alpha 固定回 255。
-          # 追加的 static 标记会往日志写一行 [AI-PATCH-v3]，用于确认手机上跑的是打过补丁的版本。
-          # 注意：锚点只用"不含换行的子串"，不要写 \r\n —— 仓库源文件是 LF，本地 Windows 上
-          # 另存会变成 CRLF，导致本地测试通过、CI 上匹配失败（已经踩过一次）。
+          # ---------------------------------------------------------------------------
+          # (2) Diagnostic helper in linuxfont.cpp: write font requests to a file with
+          #     fflush, so even if the process hangs we can see the last step reached.
+          # ---------------------------------------------------------------------------
           insert_after_first(
-              "gameui/BasePanel.cpp",
-              b'alpha = clamp( alpha, 0, 255 );',
-              b' if ( m_bRenderingBackgroundTransition && frametime >= m_flTransitionEndTime ) { m_bRenderingBackgroundTransition = false; alpha = 255; }\n'
-              b'\t\tstatic bool s_bAIReported = false; if ( !s_bAIReported ) { s_bAIReported = true; Msg( "[AI-PATCH-v3] engine patches ACTIVE\\n" ); }',
-              b'm_bRenderingBackgroundTransition = false; alpha = 255;',
-              "菜单转场+构建标记")
+              "vgui2/vgui_surfacelib/linuxfont.cpp",
+              b'#include "tier1/convar.h"\n',
+              b'''
+          #include <stdarg.h>
+          #include <stdlib.h>
+          // [AI-PATCH] font diagnostics: direct file write + fflush (survives a hang)
+          static void AIFontDiag( const char *pFmt, ... )
+          {
+          \tstatic char s_szPath[512];
+          \tstatic bool s_bInit = false;
+          \tif ( !s_bInit )
+          \t{
+          \t\ts_bInit = true;
+          \t\tconst char *pHome = getenv( "VALVE_GAME_PATH" );
+          \t\tsnprintf( s_szPath, sizeof( s_szPath ), "%s/ai_diag.txt", pHome ? pHome : "/sdcard/srceng" );
+          \t}
+          \tFILE *pFile = fopen( s_szPath, "a" );
+          \tif ( !pFile )
+          \t\treturn;
+          \tva_list args;
+          \tva_start( args, pFmt );
+          \tvfprintf( pFile, pFmt, args );
+          \tva_end( args );
+          \tfflush( pFile );
+          \tfclose( pFile );
+          }
+          ''',
+              b'[AI-PATCH] font diagnostics',
+              "font diag helper")
 
-          # ④ 卡死"加载中"状态的三处补丁（对应真机症状：右下角永久 "Loading..." 贴图 + 菜单不可见）
-          # 证据链：engine(11).log 里背景图 8 分钟后仍可见（说明没走主菜单转场），
-          #         屏幕右下角是 console/startup_loading 贴图 → 背景状态停在 BACKGROUND_LOADING；
-          #         而 SetBackgroundRenderState(BACKGROUND_LOADING) 分支里有 SetMenuAlpha( 0 )。
-          # 成因：引擎调了 OnLevelLoadingStarted()（m_bLevelLoading=true）却没有配对的
-          #       OnLevelLoadingFinished()；而 g_hLoadingDialog 只在"有加载进度上报"时才创建
-          #       （GameUI_Interface.cpp:1000-1008），所以卡死时它是空的。
-          # ④a 安全网：没有 loading 对话框、也没有关卡名 → 判定"加载中"是卡死的残状态，清掉它
-          #     （清掉后 UpdateBackgroundState 会正常落到 BACKGROUND_DISCONNECTED → 菜单 3 秒淡入）
+          replace_all("vgui2/vgui_surfacelib/linuxfont.cpp",
+                      b'\tif( !filename ) return NULL;\n\tMsg("Found font: %s\\n", filename);',
+                      b'\tif( !filename ) { AIFontDiag( "[AI-FONT] NOT-FOUND win=\'%s\'\\n", windowsFontName ); return NULL; }\n'
+                      b'\tMsg("Found font: %s\\n", filename);\n'
+                      b'\tAIFontDiag( "[AI-FONT] request win=\'%s\' file=\'%s\'\\n", windowsFontName, filename );',
+                      "font lookup trace")
+
+          # ---------------------------------------------------------------------------
+          # (3) Diagnostic helper in BasePanel.cpp
+          # ---------------------------------------------------------------------------
+          insert_before_first(
+              "gameui/BasePanel.cpp",
+              b'void CBasePanel::PaintBackground()\n{\n',
+              b'#include <stdarg.h>\n'
+              b'#include <stdlib.h>\n'
+              b'// [AI-PATCH] diagnostics: direct file write + fflush (survives a hang)\n'
+              b'static void AIDiag( const char *pFmt, ... )\n'
+              b'{\n'
+              b'\tstatic char s_szPath[512];\n'
+              b'\tstatic bool s_bInit = false;\n'
+              b'\tif ( !s_bInit )\n'
+              b'\t{\n'
+              b'\t\ts_bInit = true;\n'
+              b'\t\tconst char *pHome = getenv( "VALVE_GAME_PATH" );\n'
+              b'\t\tQ_snprintf( s_szPath, sizeof( s_szPath ), "%s/ai_diag.txt", pHome ? pHome : "/sdcard/srceng" );\n'
+              b'\t}\n'
+              b'\tFILE *pFile = fopen( s_szPath, "a" );\n'
+              b'\tif ( !pFile )\n'
+              b'\t\treturn;\n'
+              b'\tva_list args;\n'
+              b'\tva_start( args, pFmt );\n'
+              b'\tvfprintf( pFile, pFmt, args );\n'
+              b'\tva_end( args );\n'
+              b'\tfflush( pFile );\n'
+              b'\tfclose( pFile );\n'
+              b'}\n'
+              b'\n',
+              b'[AI-PATCH] diagnostics: direct file write',
+              "BasePanel diag helper")
+
+          # ---------------------------------------------------------------------------
+          # (4) State machine patches at top of UpdateBackgroundState()
+          #     (called every frame from CBasePanel::RunFrame)
+          #     a) startup banner + 1 Hz state snapshot -> ai_diag.txt
+          #     b) no level name + no loading dialog => clear stale "loading" flag and
+          #        force BACKGROUND_DISCONNECTED (which is the main-menu state)
+          # ---------------------------------------------------------------------------
           insert_after_first(
               "gameui/BasePanel.cpp",
               b'void CBasePanel::UpdateBackgroundState()\n{\n',
-              b'\t// [AI-PATCH] stale-loading guard: no loading dialog and no level name => not actually loading\n'
-              b'\tif ( m_bLevelLoading && !g_hLoadingDialog.Get() && ( !engine->GetLevelName() || !engine->GetLevelName()[0] ) )\n'
-              b'\t{\n\t\tm_bLevelLoading = false;\n\t}\n',
-              b'[AI-PATCH] stale-loading guard',
-              "卡死加载状态安全网")
-          # ④b 真在加载才隐藏菜单（原来无论真假都 SetMenuAlpha(0)，导致菜单永久不可见但可点击）
+              b'\t// [AI-PATCH] startup banner + 1Hz state snapshot\n'
+              b'\t{\n'
+              b'\t\tstatic bool s_bBanner = false;\n'
+              b'\t\tif ( !s_bBanner )\n'
+              b'\t\t{\n'
+              b'\t\t\ts_bBanner = true;\n'
+              b'\t\t\tAIDiag( "[AI-PATCH-v4] engine patches ACTIVE (font path + transition + menu force + diag)\\n" );\n'
+              b'\t\t\tMsg( "[AI-PATCH-v4] engine patches ACTIVE\\n" );\n'
+              b'\t\t}\n'
+              b'\t\tstatic float s_flNext = 0.0f;\n'
+              b'\t\tstatic int s_nCount = 0;\n'
+              b'\t\tfloat fNow = engine->Time();\n'
+              b'\t\tif ( fNow >= s_flNext )\n'
+              b'\t\t{\n'
+              b'\t\t\ts_flNext = fNow + 1.0f;\n'
+              b'\t\t\tif ( s_nCount < 120 )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\ts_nCount++;\n'
+              b'\t\t\t\tconst char *pLvl = engine->GetLevelName();\n'
+              b'\t\t\t\tAIDiag( "[AI-DIAG] #%d t=%.2f state=%d load=%d trans=%d menuA=%d dlg=%d inLvl=%d inBg=%d ever=%d plat=%d lvl=\'%s\'\\n",\n'
+              b'\t\t\t\t\ts_nCount, fNow, (int)m_eBackgroundState, (int)m_bLevelLoading, (int)m_bRenderingBackgroundTransition,\n'
+              b'\t\t\t\t\tm_pGameMenu ? m_pGameMenu->GetAlpha() : -1, g_hLoadingDialog.Get() ? 1 : 0,\n'
+              b'\t\t\t\t\tGameUI().IsInLevel() ? 1 : 0, GameUI().IsInBackgroundLevel() ? 1 : 0,\n'
+              b'\t\t\t\t\tm_bEverActivated ? 1 : 0, m_bPlatformMenuInitialized ? 1 : 0, pLvl ? pLvl : "" );\n'
+              b'\t\t\t}\n'
+              b'\t\t}\n'
+              b'\t}\n'
+              b'\t// [AI-PATCH] main menu visibility guarantee: no level name => not in a level\n'
+              b'\t{\n'
+              b'\t\tconst char *pLvl2 = engine->GetLevelName();\n'
+              b'\t\tif ( !pLvl2 || !pLvl2[0] )\n'
+              b'\t\t{\n'
+              b'\t\t\tif ( m_bLevelLoading )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\tAIDiag( "[AI-PATCH] stale loading state cleared (dlg=%d)\\n", g_hLoadingDialog.Get() ? 1 : 0 );\n'
+              b'\t\t\t\tm_bLevelLoading = false;\n'
+              b'\t\t\t\tif ( g_hLoadingDialog.Get() )\n'
+              b'\t\t\t\t{\n'
+              b'\t\t\t\t\tg_hLoadingDialog->Close();\n'
+              b'\t\t\t\t\tg_hLoadingDialog = NULL;\n'
+              b'\t\t\t\t}\n'
+              b'\t\t\t}\n'
+              b'\t\t\tif ( !m_ExitingFrameCount && !g_hLoadingDialog.Get() && !GameUI().IsInLevel()\n'
+              b'\t\t\t\t&& !GameUI().IsInBackgroundLevel() && m_eBackgroundState != BACKGROUND_DISCONNECTED )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\tAIDiag( "[AI-PATCH] force BACKGROUND_DISCONNECTED (was state=%d)\\n", (int)m_eBackgroundState );\n'
+              b'\t\t\t\tSetBackgroundRenderState( BACKGROUND_DISCONNECTED );\n'
+              b'\t\t\t}\n'
+              b'\t\t}\n'
+              b'\t}\n',
+              b'[AI-PATCH] startup banner',
+              "state snapshot + menu force")
+
+          # ---------------------------------------------------------------------------
+          # (5) Background transition: clear the flag and restore alpha once the 3s
+          #     transition is over (otherwise alpha is clamped to 0 -> screen goes
+          #     black and the bottom-right loading plate stays forever).
+          # ---------------------------------------------------------------------------
+          insert_after_first(
+              "gameui/BasePanel.cpp",
+              b'alpha = clamp( alpha, 0, 255 );',
+              b' if ( m_bRenderingBackgroundTransition && frametime >= m_flTransitionEndTime ) { m_bRenderingBackgroundTransition = false; alpha = 255; }',
+              b'm_bRenderingBackgroundTransition = false; alpha = 255;',
+              "menu transition")
+
+          # ---------------------------------------------------------------------------
+          # (6) Only hide the menu / draw the loading plate when a loading dialog really
+          #     exists.
+          # ---------------------------------------------------------------------------
           replace_all("gameui/BasePanel.cpp",
                       b'\t\tSetMenuAlpha( 0 );',
                       b'\t\tSetMenuAlpha( g_hLoadingDialog.Get() ? 0 : 255 );',
-                      "加载时才隐藏菜单")
-          # ④c 真在加载才画右下角 loading 贴图
+                      "hide menu only while loading")
           replace_all("gameui/BasePanel.cpp",
                       b'm_bRenderingBackgroundTransition || m_eBackgroundState == BACKGROUND_LOADING',
                       b'm_bRenderingBackgroundTransition || ( m_eBackgroundState == BACKGROUND_LOADING && g_hLoadingDialog.Get() )',
-                      "加载时才画 loading 贴图")
+                      "loading plate only while loading")
           PY
           echo "=== 补丁校验 ==="
           grep -c 'getenv("VALVE_GAME_PATH")' vgui2/vgui_surfacelib/linuxfont.cpp
-          grep -q 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp || (echo "!! 转场补丁未生效" && exit 1)
-          grep -q 'AI-PATCH-v3' gameui/BasePanel.cpp || (echo "!! 构建标记未插入" && exit 1)
+          grep -q 'static void AIFontDiag' vgui2/vgui_surfacelib/linuxfont.cpp || (echo '!! 字体诊断未插入' && exit 1)
+          grep -q 'static void AIDiag' gameui/BasePanel.cpp || (echo '!! 诊断工具未插入' && exit 1)
+          grep -q 'AI-PATCH-v4' gameui/BasePanel.cpp || (echo '!! 构建横幅未插入' && exit 1)
+          grep -q 'stale loading state cleared' gameui/BasePanel.cpp || (echo '!! 主菜单强制补丁未插入' && exit 1)
+          grep -q 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp || (echo '!! 转场补丁未生效' && exit 1)
           echo "补丁校验通过"
           wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip
           unzip -q android-ndk-r10e-linux-x86_64.zip
