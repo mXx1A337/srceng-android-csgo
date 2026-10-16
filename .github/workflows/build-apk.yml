@@ -61,7 +61,7 @@ jobs:
                       b'getenv("APP_DATA_PATH")', b'getenv("VALVE_GAME_PATH")',
                       "字体路径")
 
-          # ② 主菜单"永久 loading / 背景淡出成黑屏"补丁
+          # ② 主菜单"永久 loading / 背景淡出成黑屏"补丁 + ③ 构建标记
           # gameui/BasePanel.cpp 的 DrawBackgroundImage()：
           #   if ( m_bRenderingBackgroundTransition ) { alpha = ...255→0; }
           #   if ( IsPC() && ( m_bRenderingBackgroundTransition || state == BACKGROUND_LOADING ) )
@@ -69,20 +69,16 @@ jobs:
           # m_bRenderingBackgroundTransition 只在"下一次状态切换"时被清掉，而主菜单停在这个
           # 状态不再切换 → ①3 秒后背景图 alpha 变负被 clamp 成 0，整屏变黑；②loading 图标永久常驻。
           # 修法：转场时间一到就清标志并把背景 alpha 固定回 255。
+          # 追加的 static 标记会往日志写一行 [AI-PATCH-v3]，用于确认手机上跑的是打过补丁的版本。
+          # 注意：锚点只用"不含换行的子串"，不要写 \r\n —— 仓库源文件是 LF，本地 Windows 上
+          # 另存会变成 CRLF，导致本地测试通过、CI 上匹配失败（已经踩过一次）。
           insert_after_first(
               "gameui/BasePanel.cpp",
               b'alpha = clamp( alpha, 0, 255 );',
-              b' if ( m_bRenderingBackgroundTransition && frametime >= m_flTransitionEndTime ) { m_bRenderingBackgroundTransition = false; alpha = 255; }',
+              b' if ( m_bRenderingBackgroundTransition && frametime >= m_flTransitionEndTime ) { m_bRenderingBackgroundTransition = false; alpha = 255; }\n'
+              b'\t\tstatic bool s_bAIReported = false; if ( !s_bAIReported ) { s_bAIReported = true; Msg( "[AI-PATCH-v3] engine patches ACTIVE\\n" ); }',
               b'm_bRenderingBackgroundTransition = false; alpha = 255;',
-              "主菜单转场")
-
-          # ③ 构建标记：让引擎启动时往日志里写一行，用于确认手机上跑的是"打过补丁的版本"
-          insert_after_first(
-              "gameui/BasePanel.cpp",
-              b'void CBasePanel::DrawBackgroundImage()\r\n{\r\n',
-              b'\tstatic bool s_bAIReported = false;\r\n\tif ( !s_bAIReported ) { s_bAIReported = true; Msg( "\\n[AI-PATCH-v3] engine patches ACTIVE (font path + menu transition + marker)\\n" ); }\r\n',
-              b'[AI-PATCH-v3]',
-              "构建标记")
+              "菜单转场+构建标记")
           PY
           echo "=== 补丁校验 ==="
           grep -c 'getenv("VALVE_GAME_PATH")' vgui2/vgui_surfacelib/linuxfont.cpp
