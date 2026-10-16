@@ -79,6 +79,34 @@ jobs:
               b'\t\tstatic bool s_bAIReported = false; if ( !s_bAIReported ) { s_bAIReported = true; Msg( "[AI-PATCH-v3] engine patches ACTIVE\\n" ); }',
               b'm_bRenderingBackgroundTransition = false; alpha = 255;',
               "菜单转场+构建标记")
+
+          # ④ 卡死"加载中"状态的三处补丁（对应真机症状：右下角永久 "Loading..." 贴图 + 菜单不可见）
+          # 证据链：engine(11).log 里背景图 8 分钟后仍可见（说明没走主菜单转场），
+          #         屏幕右下角是 console/startup_loading 贴图 → 背景状态停在 BACKGROUND_LOADING；
+          #         而 SetBackgroundRenderState(BACKGROUND_LOADING) 分支里有 SetMenuAlpha( 0 )。
+          # 成因：引擎调了 OnLevelLoadingStarted()（m_bLevelLoading=true）却没有配对的
+          #       OnLevelLoadingFinished()；而 g_hLoadingDialog 只在"有加载进度上报"时才创建
+          #       （GameUI_Interface.cpp:1000-1008），所以卡死时它是空的。
+          # ④a 安全网：没有 loading 对话框、也没有关卡名 → 判定"加载中"是卡死的残状态，清掉它
+          #     （清掉后 UpdateBackgroundState 会正常落到 BACKGROUND_DISCONNECTED → 菜单 3 秒淡入）
+          insert_after_first(
+              "gameui/BasePanel.cpp",
+              b'void CBasePanel::UpdateBackgroundState()\n{\n',
+              b'\t// [AI-PATCH] stale-loading guard: no loading dialog and no level name => not actually loading\n'
+              b'\tif ( m_bLevelLoading && !g_hLoadingDialog.Get() && ( !engine->GetLevelName() || !engine->GetLevelName()[0] ) )\n'
+              b'\t{\n\t\tm_bLevelLoading = false;\n\t}\n',
+              b'[AI-PATCH] stale-loading guard',
+              "卡死加载状态安全网")
+          # ④b 真在加载才隐藏菜单（原来无论真假都 SetMenuAlpha(0)，导致菜单永久不可见但可点击）
+          replace_all("gameui/BasePanel.cpp",
+                      b'\t\tSetMenuAlpha( 0 );',
+                      b'\t\tSetMenuAlpha( g_hLoadingDialog.Get() ? 0 : 255 );',
+                      "加载时才隐藏菜单")
+          # ④c 真在加载才画右下角 loading 贴图
+          replace_all("gameui/BasePanel.cpp",
+                      b'm_bRenderingBackgroundTransition || m_eBackgroundState == BACKGROUND_LOADING',
+                      b'm_bRenderingBackgroundTransition || ( m_eBackgroundState == BACKGROUND_LOADING && g_hLoadingDialog.Get() )',
+                      "加载时才画 loading 贴图")
           PY
           echo "=== 补丁校验 ==="
           grep -c 'getenv("VALVE_GAME_PATH")' vgui2/vgui_surfacelib/linuxfont.cpp
