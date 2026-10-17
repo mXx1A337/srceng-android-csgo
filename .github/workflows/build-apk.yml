@@ -167,6 +167,28 @@ jobs:
               "font create exit")
 
           # ============================================================
+          # 4b) Metric sanity clamp: with unusable font metrics (variable font /
+          #     corrupted data) the computed height is absurd (real device: asked
+          #     16px, got 1603 / 6502). Accept the requested size and bail out
+          #     instead of searching, so we never render a glyph at 7000px.
+          # ============================================================
+          insert_before_first(
+              FONT,
+              b"\t\t// If we're exact or we got too small, bail.\n",
+              b'\t\t// [AI-PATCH] metric sanity: accept requested size if metrics are unusable\n'
+              b'\t\tif ( m_iHeight <= 0 || m_iHeight > m_iTall * 4 + 32 )\n'
+              b'\t\t{\n'
+              b'\t\t\tif ( nAIIter <= 3 ) AIFontDiag( "[AI-FONT-LOOP] BADMETRIC name=\'%s\' req=%d h=%d tall=%d -> use tall\\n", windowsFontName, m_iHeightRequested, m_iHeight, m_iTall );\n'
+              b'\t\t\tm_iHeight = m_iTall;\n'
+              b'\t\t\tm_iAscent = m_iTall;\n'
+              b'\t\t\tif ( m_iMaxCharWidth <= 0 || m_iMaxCharWidth > m_iTall * 4 + 32 )\n'
+              b'\t\t\t\tm_iMaxCharWidth = m_iTall;\n'
+              b'\t\t\tbreak;\n'
+              b'\t\t}\n',
+              b'[AI-FONT-LOOP] BADMETRIC',
+              "metric sanity clamp")
+
+          # ============================================================
           # 5) BasePanel diag helper (must be before UpdateBackgroundState,
           #    so anchor on the function that precedes it)
           # ============================================================
@@ -201,6 +223,73 @@ jobs:
               "BasePanel diag helper")
 
           # ============================================================
+          # 5b) THE REAL CULPRIT (found in BasePanel.cpp):
+          #       CGameMenu::ApplySchemeSettings()
+          #           int height = atoi(pScheme->GetResourceString("MainMenu.MenuItemHeight"));
+          #           SetMenuItemHeight(height);
+          #     and CBasePanel::ApplySchemeSettings()
+          #           m_iGameMenuPos.x = atoi(pClientScheme->GetResourceString("Main.Menu.X"));
+          #
+          #     CSGO replaced the VGUI main menu with Panorama years ago, so
+          #     those keys are gone from its scheme files.  atoi("") == 0 =>
+          #     every menu item is 0 pixels tall, the menu sits at 0,0 and the
+          #     menu itself is fully transparent => nothing is drawn at all.
+          #     That is exactly the "background shows, zero text" screenshot.
+          # ============================================================
+          replace_all(
+              PANEL,
+              b'\t\tSetMenuItemHeight(height);',
+              b'\t\tif ( height < 10 ) { height = IsProportional() ? scheme()->GetProportionalScaledValue( 34 ) : 34; }\n'
+              b'\t\tSetMenuItemHeight(height);',
+              "menu item height")
+
+          insert_after_first(
+              PANEL,
+              b'\tm_iGameMenuPos.y = scheme()->GetProportionalScaledValue( m_iGameMenuPos.y );',
+              b'\n'
+              b'\t\t// [AI-PATCH-v8] no Main.Menu.X/Y in the CSGO scheme -> menu sat at 0,0\n'
+              b'\t\t{\n'
+              b'\t\t\tint nSW = 0, nSH = 0;\n'
+              b'\t\t\tvgui::surface()->GetScreenSize( nSW, nSH );\n'
+              b'\t\t\tif ( m_iGameMenuPos.x < nSW / 20 ) m_iGameMenuPos.x = nSW / 16;\n'
+              b'\t\t\tif ( m_iGameMenuPos.y < nSH / 20 ) m_iGameMenuPos.y = nSH * 35 / 100;\n'
+              b'\t\t}\n',
+              b'[AI-PATCH-v8] no Main.Menu.X/Y',
+              "menu position")
+
+          # ============================================================
+          # 5c) Last-resort labels: if every menu label localised to an empty
+          #     string (no gameui_english.txt, or the .res we dropped on the
+          #     phone was never read), add literal entries in code.
+          # ============================================================
+          insert_before_first(
+              PANEL,
+              b'\treturn menu;\n}',
+              b'\t// [AI-PATCH-v8] hard-coded items fallback:\n'
+              b'\t{\n'
+              b'\t\tbool bAnyLabel = false;\n'
+              b'\t\tfor ( int i = 0; i < menu->GetChildCount(); i++ )\n'
+              b'\t\t{\n'
+              b'\t\t\tvgui::MenuItem *pMI = dynamic_cast<vgui::MenuItem *>( menu->GetChild( i ) );\n'
+              b'\t\t\tif ( pMI && pMI->GetText() && pMI->GetText()[0] ) { bAnyLabel = true; break; }\n'
+              b'\t\t}\n'
+              b'\t\tif ( !bAnyLabel )\n'
+              b'\t\t{\n'
+              b'\t\t\tmenu->AddMenuItem( "AI_FindServers", "FIND SERVERS", "OpenServerBrowser", this );\n'
+              b'\t\t\tmenu->AddMenuItem( "AI_CreateServer", "CREATE SERVER", "OpenCreateMultiplayerGameDialog", this );\n'
+              b'\t\t\tmenu->AddMenuItem( "AI_Options", "OPTIONS", "OpenOptionsDialog", this );\n'
+              b'\t\t\tmenu->AddMenuItem( "AI_Quit", "QUIT", "Quit", this );\n'
+              b'\t\t\tAIDiag( "[AI-MENU] all labels empty -> added 4 hard-coded items\\n" );\n'
+              b'\t\t}\n'
+              b'\t\telse\n'
+              b'\t\t{\n'
+              b'\t\t\tAIDiag( "[AI-MENU] labels loaded OK, children=%d\\n", menu->GetChildCount() );\n'
+              b'\t\t}\n'
+              b'\t}\n',
+              b'[AI-PATCH-v8] hard-coded items fallback',
+              "hard-coded menu items")
+
+          # ============================================================
           # 6) Startup banner + 1 Hz state snapshot + main-menu force
           #    (at the top of CBasePanel::UpdateBackgroundState, called every
           #     frame from CBasePanel::RunFrame)
@@ -214,8 +303,8 @@ jobs:
               b'\t\tif ( !s_bBanner )\n'
               b'\t\t{\n'
               b'\t\t\ts_bBanner = true;\n'
-              b'\t\t\tAIDiag( "[AI-PATCH-v5] engine patches ACTIVE (font path + transition + menu force + diag)\\n" );\n'
-              b'\t\t\tMsg( "[AI-PATCH-v5] engine patches ACTIVE\\n" );\n'
+              b'\t\t\tAIDiag( "[AI-PATCH-v8] engine patches ACTIVE (font + transition + menu force + menu metrics + direct text)\\n" );\n'
+              b'\t\t\tMsg( "[AI-PATCH-v8] engine patches ACTIVE\\n" );\n'
               b'\t\t}\n'
               b'\t\tstatic float s_flNext = 0.0f;\n'
               b'\t\tstatic int s_nCount = 0;\n'
@@ -262,6 +351,157 @@ jobs:
               "banner + state snapshot + menu force")
 
           # ============================================================
+          # 6b) Every frame: force the menu visible / opaque / legible.
+          #     Plus a one-shot deep dump (label text, font handle, font tall,
+          #     fg colour, item rect) at t>15s.
+          # ============================================================
+          insert_before_first(
+              PANEL,
+              b'\t// [AI-PATCH] main menu visibility guarantee: no level name => not in a level\n',
+              b'\t// [AI-PATCH-v8] force menu visible / opaque / legible (every frame)\n'
+              b'\t{\n'
+              b'\t\tif ( m_pGameMenu )\n'
+              b'\t\t{\n'
+              b'\t\t\tif ( m_pGameMenu->GetAlpha() < 250 ) m_pGameMenu->SetAlpha( 255 );\n'
+              b'\t\t\tif ( !m_pGameMenu->IsVisible() ) m_pGameMenu->SetVisible( true );\n'
+              b'\t\t\tstatic vgui::HFont s_hMenuFont = 0;\n'
+              b'\t\t\tif ( !s_hMenuFont )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\tvgui::ISurface *pSM = surface();\n'
+              b'\t\t\t\tvgui::IScheme *pSchM = vgui::scheme()->GetIScheme( vgui::scheme()->GetScheme( "ClientScheme" ) );\n'
+              b'\t\t\t\tif ( !pSchM ) pSchM = vgui::scheme()->GetIScheme( vgui::scheme()->GetScheme( "SourceScheme" ) );\n'
+              b'\t\t\t\tif ( pSchM )\n'
+              b'\t\t\t\t{\n'
+              b'\t\t\t\t\tvgui::HFont hTryM = pSchM->GetFont( "Default", true );\n'
+              b'\t\t\t\t\tif ( hTryM && pSM->GetFontTall( hTryM ) > 0 ) s_hMenuFont = hTryM;\n'
+              b'\t\t\t\t}\n'
+              b'\t\t\t\tif ( !s_hMenuFont )\n'
+              b'\t\t\t\t{\n'
+              b'\t\t\t\t\ts_hMenuFont = pSM->CreateFont();\n'
+              b'\t\t\t\t\tpSM->SetFontGlyphSet( s_hMenuFont, "DejaVu Sans", 30, 500, 0, 0, 0x010 );\n'
+              b'\t\t\t\t}\n'
+              b'\t\t\t\tAIDiag( "[AI-MENU] menu font handle=%d tall=%d\\n", (int)s_hMenuFont, (int)pSM->GetFontTall( s_hMenuFont ) );\n'
+              b'\t\t\t}\n'
+              b'\t\t\tint nIt = m_pGameMenu->GetChildCount();\n'
+              b'\t\t\tfor ( int i = 0; i < nIt; i++ )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\tvgui::Panel *pIt = m_pGameMenu->GetChild( i );\n'
+              b'\t\t\t\tif ( !pIt ) continue;\n'
+              b'\t\t\t\tif ( !pIt->IsVisible() ) pIt->SetVisible( true );\n'
+              b'\t\t\t\tif ( pIt->GetAlpha() < 250 ) pIt->SetAlpha( 255 );\n'
+              b'\t\t\t\tpIt->SetFgColor( Color( 255, 255, 0, 255 ) );\n'
+              b'\t\t\t\tpIt->SetBgColor( Color( 0, 0, 0, 130 ) );\n'
+              b'\t\t\t\tpIt->SetPaintBackgroundEnabled( true );\n'
+              b'\t\t\t\tvgui::MenuItem *pMIM = dynamic_cast<vgui::MenuItem *>( pIt );\n'
+              b'\t\t\t\tif ( pMIM && s_hMenuFont && pMIM->GetFont() != s_hMenuFont ) pMIM->SetFont( s_hMenuFont );\n'
+              b'\t\t\t}\n'
+              b'\t\t}\n'
+              b'\t}\n'
+              b'\t// [AI-PATCH-v8] one-shot deep menu dump\n'
+              b'\t{\n'
+              b'\t\tstatic bool s_bMenuDumped = false;\n'
+              b'\t\tif ( !s_bMenuDumped && m_pGameMenu && engine->Time() > 15.0f )\n'
+              b'\t\t{\n'
+              b'\t\t\ts_bMenuDumped = true;\n'
+              b'\t\t\tint mw = 0, mh = 0, mx = 0, my = 0;\n'
+              b'\t\t\tm_pGameMenu->GetSize( mw, mh );\n'
+              b'\t\t\tm_pGameMenu->GetPos( mx, my );\n'
+              b'\t\t\tint nCC = m_pGameMenu->GetChildCount();\n'
+              b'\t\t\tint sw = 0, sh = 0;\n'
+              b'\t\t\tvgui::surface()->GetScreenSize( sw, sh );\n'
+              b'\t\t\tAIDiag( "[AI-MENU] screen=%dx%d menu vis=%d alpha=%d pos=%d,%d size=%dx%d children=%d\\n",\n'
+              b'\t\t\t\tsw, sh, m_pGameMenu->IsVisible() ? 1 : 0, m_pGameMenu->GetAlpha(), mx, my, mw, mh, nCC );\n'
+              b'\t\t\tfor ( int i = 0; i < nCC && i < 14; i++ )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\tvgui::Panel *pIt = m_pGameMenu->GetChild( i );\n'
+              b'\t\t\t\tif ( !pIt ) { AIDiag( "[AI-MENU] item %d = NULL\\n", i ); continue; }\n'
+              b'\t\t\t\tint iw = 0, ih = 0, ix = 0, iy = 0;\n'
+              b'\t\t\t\tpIt->GetSize( iw, ih );\n'
+              b'\t\t\t\tpIt->GetPos( ix, iy );\n'
+              b'\t\t\t\tvgui::MenuItem *pMI = dynamic_cast<vgui::MenuItem *>( pIt );\n'
+              b'\t\t\t\tconst wchar_t *w = pMI ? pMI->GetText() : NULL;\n'
+              b'\t\t\t\tchar szT[96];\n'
+              b'\t\t\t\tint k = 0;\n'
+              b'\t\t\t\tif ( w ) { while ( w[k] && k < 90 ) { szT[k] = ( w[k] < 128 ) ? (char)w[k] : \'?\'; k++; } }\n'
+              b'\t\t\t\tszT[k] = 0;\n'
+              b'\t\t\t\tvgui::HFont hF = pMI ? pMI->GetFont() : 0;\n'
+              b'\t\t\t\tint iFT = ( (int)hF > 0 ) ? (int)vgui::surface()->GetFontTall( hF ) : -1;\n'
+              b'\t\t\t\tColor cFg = pIt->GetFgColor();\n'
+              b'\t\t\t\tAIDiag( "[AI-MENU] item %d vis=%d alpha=%d pos=%d,%d size=%dx%d cls=%s font=%d ftall=%d fg=%d,%d,%d,%d text=\'%s\'\\n",\n'
+              b'\t\t\t\t\ti, pIt->IsVisible() ? 1 : 0, pIt->GetAlpha(), ix, iy, iw, ih, pIt->GetClassName(),\n'
+              b'\t\t\t\t\t(int)hF, iFT,\n'
+              b'\t\t\t\t\t(int)cFg.r(), (int)cFg.g(), (int)cFg.b(), (int)cFg.a(), szT );\n'
+              b'\t\t\t}\n'
+              b'\t\t}\n'
+              b'\t}\n',
+              b'[AI-PATCH-v8] one-shot deep menu dump',
+              "menu force + deep dump")
+
+          # ============================================================
+          # 6d) Paint straight to the surface, bypassing vgui menu + scheme.
+          #     Two jobs:
+          #       1) "AI-TEXT-OK w x h ftall=NN" proves the glyph pipeline.
+          #       2) repaint every menu label ourselves, so even if the vgui
+          #          MenuItem path is broken the user still sees the entries.
+          # ============================================================
+          insert_after_first(
+              PANEL,
+              b'\t\tDrawBackgroundImage();\n',
+              b'\n'
+              b'\t\t// [AI-PATCH-v8] direct surface text + menu label fallback\n'
+              b'\t\t{\n'
+              b'\t\t\tvgui::ISurface *pS = surface();\n'
+              b'\t\t\tstatic vgui::HFont s_hAIFont = 0;\n'
+              b'\t\t\tif ( !s_hAIFont )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\tvgui::IScheme *pSch = vgui::scheme()->GetIScheme( vgui::scheme()->GetScheme( "ClientScheme" ) );\n'
+              b'\t\t\t\tif ( !pSch ) pSch = vgui::scheme()->GetIScheme( vgui::scheme()->GetScheme( "SourceScheme" ) );\n'
+              b'\t\t\t\tif ( pSch )\n'
+              b'\t\t\t\t{\n'
+              b'\t\t\t\t\tvgui::HFont hTry = pSch->GetFont( "Default", true );\n'
+              b'\t\t\t\t\tif ( hTry && pS->GetFontTall( hTry ) > 0 ) s_hAIFont = hTry;\n'
+              b'\t\t\t\t}\n'
+              b'\t\t\t\tif ( !s_hAIFont )\n'
+              b'\t\t\t\t{\n'
+              b'\t\t\t\t\ts_hAIFont = pS->CreateFont();\n'
+              b'\t\t\t\t\tpS->SetFontGlyphSet( s_hAIFont, "DejaVu Sans", 26, 500, 0, 0, 0x010 );\n'
+              b'\t\t\t\t}\n'
+              b'\t\t\t}\n'
+              b'\t\t\tint nSW = 0, nSH = 0;\n'
+              b'\t\t\tpS->GetScreenSize( nSW, nSH );\n'
+              b'\t\t\twchar_t wszAI[128];\n'
+              b'\t\t\tint nLen = swprintf( wszAI, sizeof( wszAI ) / sizeof( wszAI[0] ), L"AI-TEXT-OK %dx%d ftall=%d", nSW, nSH, (int)pS->GetFontTall( s_hAIFont ) );\n'
+              b'\t\t\tif ( nLen <= 0 ) { wszAI[0] = L\'A\'; wszAI[1] = 0; nLen = 1; }\n'
+              b'\t\t\tpS->DrawSetTextFont( s_hAIFont );\n'
+              b'\t\t\tpS->DrawSetTextColor( 0, 255, 0, 255 );\n'
+              b'\t\t\tpS->DrawSetTextPos( 24, 24 );\n'
+              b'\t\t\tpS->DrawPrintText( wszAI, nLen );\n'
+              b'\t\t\tif ( m_pGameMenu )\n'
+              b'\t\t\t{\n'
+              b'\t\t\t\tint nIt2 = m_pGameMenu->GetChildCount();\n'
+              b'\t\t\t\tfor ( int i2 = 0; i2 < nIt2; i2++ )\n'
+              b'\t\t\t\t{\n'
+              b'\t\t\t\t\tvgui::Panel *pIt2 = m_pGameMenu->GetChild( i2 );\n'
+              b'\t\t\t\t\tif ( !pIt2 ) continue;\n'
+              b'\t\t\t\t\tvgui::MenuItem *pMI2 = dynamic_cast<vgui::MenuItem *>( pIt2 );\n'
+              b'\t\t\t\t\tif ( !pMI2 ) continue;\n'
+              b'\t\t\t\t\tconst wchar_t *wszIt = pMI2->GetText();\n'
+              b'\t\t\t\t\tif ( !wszIt || !wszIt[0] ) continue;\n'
+              b'\t\t\t\t\tint ix2 = 0, iy2 = 0;\n'
+              b'\t\t\t\t\tpIt2->GetPos( ix2, iy2 );\n'
+              b'\t\t\t\t\tvgui::Panel *pPar2 = pIt2->GetParent();\n'
+              b'\t\t\t\t\twhile ( pPar2 && pPar2 != this ) { int px2 = 0, py2 = 0; pPar2->GetPos( px2, py2 ); ix2 += px2; iy2 += py2; pPar2 = pPar2->GetParent(); }\n'
+              b'\t\t\t\t\tpS->DrawSetTextFont( s_hAIFont );\n'
+              b'\t\t\t\t\tpS->DrawSetTextColor( 255, 255, 0, 255 );\n'
+              b'\t\t\t\t\tpS->DrawSetTextPos( ix2 + 20, iy2 + 4 );\n'
+              b'\t\t\t\t\tpS->DrawPrintText( wszIt, (int)wcslen( wszIt ) );\n'
+              b'\t\t\t\t}\n'
+              b'\t\t\t}\n'
+              b'\t\t}\n',
+              b'[AI-PATCH-v8] direct surface text',
+              "direct surface text")
+
+          # ============================================================
           # 7) Background transition: clear flag + restore alpha after 3s
           # ============================================================
           insert_after_first(
@@ -287,9 +527,15 @@ jobs:
           grep -c 'getenv("VALVE_GAME_PATH")' vgui2/vgui_surfacelib/linuxfont.cpp
           grep -q 'static void AIFontDiag' vgui2/vgui_surfacelib/linuxfont.cpp || (echo '!! 字体诊断未插入' && exit 1)
           grep -q 'AI-FONT-LOOP] ABORT' vgui2/vgui_surfacelib/linuxfont.cpp || (echo '!! 字体循环保护未插入' && exit 1)
+          grep -q 'AI-FONT-LOOP] BADMETRIC' vgui2/vgui_surfacelib/linuxfont.cpp || (echo '!! 度量保护未插入' && exit 1)
           grep -q 'static void AIDiag' gameui/BasePanel.cpp || (echo '!! 诊断工具未插入' && exit 1)
-          grep -q 'AI-PATCH-v5' gameui/BasePanel.cpp || (echo '!! 构建横幅未插入' && exit 1)
+          grep -q 'AI-PATCH-v8' gameui/BasePanel.cpp || (echo '!! 构建横幅未插入' && exit 1)
           grep -q 'stale loading state cleared' gameui/BasePanel.cpp || (echo '!! 主菜单强制补丁未插入' && exit 1)
+          grep -q 'height < 10' gameui/BasePanel.cpp || (echo '!! 菜单行高修正未插入' && exit 1)
+          grep -q 'no Main.Menu.X/Y' gameui/BasePanel.cpp || (echo '!! 菜单位置修正未插入' && exit 1)
+          grep -q 'AI-TEXT-OK' gameui/BasePanel.cpp || (echo '!! 文字直绘未插入' && exit 1)
+          grep -q 'hard-coded items fallback' gameui/BasePanel.cpp || (echo '!! 菜单兜底项未插入' && exit 1)
+          grep -q 'AI-MENU] screen=' gameui/BasePanel.cpp || (echo '!! 菜单深度转储未插入' && exit 1)
           grep -q 'm_bRenderingBackgroundTransition = false; alpha = 255;' gameui/BasePanel.cpp || (echo '!! 转场补丁未生效' && exit 1)
           echo "补丁校验通过"
           wget -q https://dl.google.com/android/repository/android-ndk-r10e-linux-x86_64.zip
